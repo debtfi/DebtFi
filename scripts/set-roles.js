@@ -13,13 +13,21 @@ async function main() {
   // manually to make sure everything is compiled
   // await hre.run('compile');
 
+  const [signer] = await hre.ethers.getSigners()
+
+  console.log(`deployer balance: ${await signer.getBalance()}`)
+
   // We get the contract to deploy
-  const Greeter = await hre.ethers.getContractFactory("Greeter");
-  const greeter = await Greeter.deploy("Hello, Hardhat!");
+  const DebtFi = await hre.ethers.getContractFactory("DebtFi", signer);
+  const { CONTRACT_ADDRESS } = process.env
+  if (!CONTRACT_ADDRESS) throw new Error('CONTRACT_ADDRESS not found')
+  const contract = DebtFi.attach(CONTRACT_ADDRESS)
 
-  await greeter.deployed();
+  const dcTx = await contract.functions.setDealCreators(['0x4F15bd55BBA6eDf8bc6879Af5f984024f676fB68'])
+  const vTx = await contract.functions.setValidators(['0x4F15bd55BBA6eDf8bc6879Af5f984024f676fB68'])
 
-  console.log("Greeter deployed to:", greeter.address);
+  console.log(`dcTx: ${JSON.stringify(dcTx)}`)
+  console.log(`vTx: ${JSON.stringify(vTx)}`)
 }
 
 // We recommend this pattern to be able to use async/await everywhere
