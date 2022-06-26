@@ -34,10 +34,12 @@ contract DebtFi is AccessControl, ERC20 {
     bytes32 public constant DEAL_CREATOR_ROLE = keccak256("DEAL_CREATOR_ROLE");
     bytes32 public constant VALIDATOR_ROLE = keccak256("VALIDATOR_ROLE");
     bytes32 public constant BORROWER_ROLE = keccak256("BORROWER_ROLE");
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
-    uint256 public constant DEAL_CREATOR_RATE = 20;
-    uint256 public constant LENDER_RATE = 20;
-    uint256 public constant VALIDATOR_RATE = 20;
+    uint256 public constant DEAL_CREATOR_RATE = 50;
+    uint256 public constant LENDER_RATE = 35;
+    uint256 public constant VALIDATOR_RATE = 5;
+    uint256 public constant PROTOCOL_RATE = 10;
 
     IERC20 public immutable asset;
 
@@ -45,6 +47,8 @@ contract DebtFi is AccessControl, ERC20 {
     uint256 public immutable poolSize;
     uint256 public immutable interestRate;
     uint256 public immutable deadline;
+
+    uint256 public juniorPoolSize;
 
     uint256 private _totalAssets;
 
@@ -59,7 +63,8 @@ contract DebtFi is AccessControl, ERC20 {
         address _borrower,
         uint256 _poolSize,
         uint256 _interestRate,
-        uint256 _deadline
+        uint256 _deadline,
+        address _admin
     ) ERC20(_name, _symbol) {
         asset = _asset;
         borrower = _borrower;
@@ -67,19 +72,30 @@ contract DebtFi is AccessControl, ERC20 {
         interestRate = _interestRate;
         deadline = _deadline;
         _setupRole(BORROWER_ROLE, _borrower);
+        _setupRole(ADMIN_ROLE, _admin);
+        _setRoleAdmin(DEAL_CREATOR_ROLE, ADMIN_ROLE);
+        _setRoleAdmin(VALIDATOR_ROLE, ADMIN_ROLE);
     }
 
-    function setDealCreators(address[] memory _dealCreators) public virtual {
+    function setDealCreators(address[] memory _dealCreators)
+        public
+        virtual
+        onlyRole(ADMIN_ROLE)
+    {
         for (uint256 i = 0; i < _dealCreators.length; i++)
             grantRole(DEAL_CREATOR_ROLE, _dealCreators[i]);
     }
 
-    function setValidators(address[] memory _validators) public virtual {
+    function setValidators(address[] memory _validators)
+        public
+        virtual
+        onlyRole(ADMIN_ROLE)
+    {
         for (uint256 i = 0; i < _validators.length; i++)
             grantRole(VALIDATOR_ROLE, _validators[i]);
     }
 
-    function validate(uint256 juniorPoolSize)
+    function validate(uint256 _juniorPoolSize)
         public
         virtual
         onlyRole(VALIDATOR_ROLE)
@@ -89,6 +105,9 @@ contract DebtFi is AccessControl, ERC20 {
         require((shares = previewValidate()) != 0, "ZERO_SHARES");
 
         _mint(_msgSender(), shares);
+
+        juniorPoolSize = _juniorPoolSize;
+        _validated = true;
 
         emit Validate(_msgSender(), juniorPoolSize, shares);
     }
@@ -120,7 +139,10 @@ contract DebtFi is AccessControl, ERC20 {
 
         emit Payback(_msgSender(), assets);
 
-        if (asset.balanceOf(_msgSender()) >= poolSize * (1 + interestRate)) {
+        if (
+            asset.balanceOf(_msgSender()) >=
+            (poolSize * (100 + interestRate)) / 100
+        ) {
             _fullyPaid = true;
             emit FullyPaid(_msgSender());
         }
@@ -146,7 +168,7 @@ contract DebtFi is AccessControl, ERC20 {
     }
 
     function totalAssets() public view virtual returns (uint256) {
-        return asset.balanceOf(_msgSender());
+        return asset.balanceOf(address(this));
     }
 
     function convertToShares(uint256 assets)
@@ -156,14 +178,12 @@ contract DebtFi is AccessControl, ERC20 {
         returns (uint256)
     {
         uint256 roleRate = LENDER_RATE;
+        if (hasRole(VALIDATOR_ROLE, _msgSender())) roleRate = VALIDATOR_RATE;
         if (hasRole(DEAL_CREATOR_ROLE, _msgSender()))
             roleRate = DEAL_CREATOR_RATE;
-        if (hasRole(VALIDATOR_ROLE, _msgSender())) roleRate = VALIDATOR_RATE;
 
-        return
-            assets +
-            (assets / poolSize) *
-            ((poolSize * interestRate * roleRate) / 100);
+        uint256 interest = (poolSize * interestRate * roleRate) / (100 * 100);
+        return assets > 0 ? assets + (assets * interest) / poolSize : interest;
     }
 
     function convertToAssets(uint256 shares)
