@@ -5,40 +5,52 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 
 contract DebtFi is AccessControl, ERC20 {
     using SafeERC20 for IERC20;
-    
+    using Math for uint256;
+
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
     //////////////////////////////////////////////////////////////*/
 
     event Deposit(address indexed owner, uint256 assets, uint256 shares);
 
-    event Validate(address indexed validator, uint256 juniorPoolSize, uint256 shares);
-
-    event Redeem(
-        address indexed receiver,
-        uint256 assets,
+    event Validate(
+        address indexed validator,
+        uint256 juniorPoolSize,
         uint256 shares
     );
+
+    event Borrow(address indexed borrower, uint256 assets);
+
+    event Payback(address indexed borrower, uint256 assets);
+
+    event Redeem(address indexed receiver, uint256 assets, uint256 shares);
+
+    event FullyPaid(address indexed borrower);
 
     bytes32 public constant DEAL_CREATOR_ROLE = keccak256("DEAL_CREATOR_ROLE");
     bytes32 public constant VALIDATOR_ROLE = keccak256("VALIDATOR_ROLE");
     bytes32 public constant BORROWER_ROLE = keccak256("BORROWER_ROLE");
 
-    uint256 public constant DEAL_CREATOR_RATE = 0.2;
-    uint256 public constant LENDER_RATE = 0.2;
-    uint256 public constant VALIDATOR_RATE = 0.2;
+    uint256 public constant DEAL_CREATOR_RATE = 20;
+    uint256 public constant LENDER_RATE = 20;
+    uint256 public constant VALIDATOR_RATE = 20;
 
     IERC20 public immutable asset;
 
     address public immutable borrower;
     uint256 public immutable poolSize;
-    uint256 public immutable interestRate; 
+    uint256 public immutable interestRate;
     uint256 public immutable deadline;
 
     uint256 private _totalAssets;
+
+    bool private _validated = false;
+    bool private _poolFull = false;
+    bool private _fullyPaid = false;
 
     constructor(
         IERC20 _asset,
@@ -57,17 +69,22 @@ contract DebtFi is AccessControl, ERC20 {
         _setupRole(BORROWER_ROLE, _borrower);
     }
 
-    function setDealCreators(address[] memory _dealCreators) public virtual returns (uint256 shares) {
-        for (uint i = 0; i < _dealCreators.length; i++)
+    function setDealCreators(address[] memory _dealCreators) public virtual {
+        for (uint256 i = 0; i < _dealCreators.length; i++)
             grantRole(DEAL_CREATOR_ROLE, _dealCreators[i]);
     }
 
-    function setValidators(address[] memory _validators) public virtual returns (uint256 shares) {
-        for (uint i = 0; i < _validators.length; i++)
+    function setValidators(address[] memory _validators) public virtual {
+        for (uint256 i = 0; i < _validators.length; i++)
             grantRole(VALIDATOR_ROLE, _validators[i]);
     }
 
-    function validate(uint256 juniorPoolSize) public virtual returns (uint256 shares) {
+    function validate(uint256 juniorPoolSize)
+        public
+        virtual
+        onlyRole(VALIDATOR_ROLE)
+        returns (uint256 shares)
+    {
         // Check for rounding error since we round down in previewDeposit.
         require((shares = previewValidate()) != 0, "ZERO_SHARES");
 
@@ -77,6 +94,7 @@ contract DebtFi is AccessControl, ERC20 {
     }
 
     function deposit(uint256 assets) public virtual returns (uint256 shares) {
+        require(_validated, "NOT_VAILDATED");
         // Check for rounding error since we round down in previewDeposit.
         require((shares = previewDeposit(assets)) != 0, "ZERO_SHARES");
 
@@ -89,23 +107,26 @@ contract DebtFi is AccessControl, ERC20 {
     }
 
     function borrow(uint256 assets) public virtual onlyRole(BORROWER_ROLE) {
-        // TODO: Check pool is full
+        require(_poolFull, "POOL_NOT_FULL");
+        require(!_fullyPaid, "FULLY_PAID");
+
         asset.safeTransfer(_msgSender(), assets);
 
-        emit Deposit(_msgSender(), assets, shares);
+        emit Borrow(_msgSender(), assets);
     }
 
-    function payback(
-        uint256 assets
-    ) public virtual onlyRole(BORROWER_ROLE) {
+    function payback(uint256 assets) public virtual onlyRole(BORROWER_ROLE) {
         asset.safeTransferFrom(_msgSender(), address(this), assets);
 
-        emit Deposit(_msgSender(), assets, shares);
+        emit Payback(_msgSender(), assets);
+
+        if (asset.balanceOf(_msgSender()) >= poolSize * (1 + interestRate)) {
+            _fullyPaid = true;
+            emit FullyPaid(_msgSender());
+        }
     }
 
-    function redeem(
-        uint256 shares
-    ) public virtual returns (uint256 assets) {
+    function redeem(uint256 shares) public virtual returns (uint256 assets) {
         // Check for rounding error since we round down in previewRedeem.
         require((assets = previewRedeem(shares)) != 0, "ZERO_ASSETS");
 
@@ -120,46 +141,60 @@ contract DebtFi is AccessControl, ERC20 {
                             ACCOUNTING LOGIC
     //////////////////////////////////////////////////////////////*/
 
-    function decimals() public view override returns (uint8) {
+    function decimals() public pure override returns (uint8) {
         return 6; // USDC
     }
 
-    function totalAssets() public view virtual returns (uint256);
-
-    function convertToShares(uint256 assets) public view virtual returns (uint256) {
-        uint256 supply = totalSupply(); // Saves an extra SLOAD if totalSupply is non-zero.
-
-        return supply == 0 ? assets : assets.mulDivDown(supply, totalAssets());
+    function totalAssets() public view virtual returns (uint256) {
+        return asset.balanceOf(_msgSender());
     }
 
-    function convertToAssets(uint256 shares) public view virtual returns (uint256) {
-        uint256 supply = totalSupply; // Saves an extra SLOAD if totalSupply is non-zero.
+    function convertToShares(uint256 assets)
+        public
+        view
+        virtual
+        returns (uint256)
+    {
+        uint256 roleRate = LENDER_RATE;
+        if (hasRole(DEAL_CREATOR_ROLE, _msgSender()))
+            roleRate = DEAL_CREATOR_RATE;
+        if (hasRole(VALIDATOR_ROLE, _msgSender())) roleRate = VALIDATOR_RATE;
 
-        return supply == 0 ? shares : shares.mulDivDown(totalAssets(), supply);
+        return
+            assets +
+            (assets / poolSize) *
+            ((poolSize * interestRate * roleRate) / 100);
     }
 
-    function previewDeposit(uint256 assets) public view virtual returns (uint256) {
+    function convertToAssets(uint256 shares)
+        public
+        view
+        virtual
+        returns (uint256)
+    {
+        return shares;
+    }
+
+    function previewDeposit(uint256 assets)
+        public
+        view
+        virtual
+        returns (uint256)
+    {
         return convertToShares(assets);
     }
 
     function previewValidate() public view virtual returns (uint256) {
-        return convertToShares(assets);
+        return convertToShares(0);
     }
 
-    // function previewMint(uint256 shares) public view virtual returns (uint256) {
-    //     uint256 supply = totalSupply; // Saves an extra SLOAD if totalSupply is non-zero.
-
-    //     return supply == 0 ? shares : shares.mulDivUp(totalAssets(), supply);
-    // }
-
-    // function previewWithdraw(uint256 assets) public view virtual returns (uint256) {
-    //     uint256 supply = totalSupply; // Saves an extra SLOAD if totalSupply is non-zero.
-
-    //     return supply == 0 ? assets : assets.mulDivUp(supply, totalAssets());
-    // }
-
-    function previewRedeem(uint256 shares) public view virtual returns (uint256) {
-        return convertToAssets(shares);
+    function previewRedeem(uint256 shares)
+        public
+        view
+        virtual
+        returns (uint256)
+    {
+        return convertToAssets(shares).min(asset.balanceOf(_msgSender()));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -170,15 +205,7 @@ contract DebtFi is AccessControl, ERC20 {
         return type(uint256).max;
     }
 
-    // function maxMint(address) public view virtual returns (uint256) {
-    //     return type(uint256).max;
-    // }
-
-    // function maxWithdraw(address owner) public view virtual returns (uint256) {
-    //     return convertToAssets(balanceOf[owner]);
-    // }
-
     function maxRedeem(address owner) public view virtual returns (uint256) {
-        return balanceOf[owner];
+        return balanceOf(owner);
     }
 }
